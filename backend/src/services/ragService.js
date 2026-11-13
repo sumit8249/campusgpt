@@ -1,28 +1,35 @@
 const { GoogleGenerativeAI } = require("@google/generative-ai");
 const DocumentChunk = require("../models/DocumentChunk");
 
+const apiKey = (process.env.GEMINI_API_KEY || "").trim();
 const genAI =
-  process.env.GEMINI_API_KEY && process.env.GEMINI_API_KEY !== "your_google_gemini_api_key_here"
-    ? new GoogleGenerativeAI(process.env.GEMINI_API_KEY)
+  apiKey && apiKey !== "your_google_gemini_api_key_here"
+    ? new GoogleGenerativeAI(apiKey)
     : null;
 
 /**
- * Split extracted document text into overlapping chunks for semantic retrieval.
+ * Split extracted document text into clean, sentence-aligned chunks.
  */
-function chunkText(text, chunkSize = 850, overlap = 150) {
-  const cleaned = text.replace(/\s+/g, " ").trim();
+function chunkText(text, chunkSize = 850, overlap = 120) {
+  const cleaned = text.replace(/={3,}/g, " ").replace(/\s+/g, " ").trim();
+  const sentences = cleaned.match(/[^.!?]+[.!?]+|[^.!?]+$/g) || [cleaned];
   const chunks = [];
-  let start = 0;
+  let current = "";
 
-  while (start < cleaned.length) {
-    const end = Math.min(start + chunkSize, cleaned.length);
-    const slice = cleaned.slice(start, end).trim();
-    if (slice.length > 35) {
-      chunks.push(slice);
+  for (const sentence of sentences) {
+    const trimmed = sentence.trim();
+    if (!trimmed) continue;
+
+    if ((current + " " + trimmed).trim().length <= chunkSize) {
+      current = (current + " " + trimmed).trim();
+    } else {
+      if (current.length > 35) chunks.push(current);
+      const overlapText = current.slice(-overlap).replace(/^\S*\s/, "");
+      current = (overlapText + " " + trimmed).trim();
     }
-    if (end === cleaned.length) break;
-    start += chunkSize - overlap;
   }
+
+  if (current.length > 35) chunks.push(current);
   return chunks;
 }
 
@@ -64,8 +71,8 @@ async function generateEmbedding(text) {
       if (result?.embedding?.values?.length) {
         return result.embedding.values;
       }
-    } catch {
-      // Try next available embedding model
+    } catch (err) {
+      console.warn(`Embedding fallback (${modelName}):`, err.message);
     }
   }
 
@@ -144,12 +151,12 @@ async function answerCollegeQuery(question, departmentFilter = "All", history = 
     .map((m) => `${m.role === "user" ? "Student" : "Campus GPT"}: ${m.content}`)
     .join("\n");
 
-  const prompt = `You are Campus GPT, the official AI information assistant for Birla Global University (BGU).
+  const prompt = `You are Campus GPT, the official AI information assistant for Birla Global University (BGU), Bhubaneswar.
 Answer the student's question using ONLY the verified College Context provided below.
 Strict Rules:
 1. Never invent dates, fees, eligibility rules, or policies not explicitly stated in the context.
 2. Naturally cite the source document title(s) in your response.
-3. If only part of the question is covered in the context, answer what is verified and note what is not specified.
+3. If the context does not contain the exact detail asked (such as tuition or semester fees), explicitly state that it is not specified in the uploaded documents and only share related verified details if helpful.
 4. Use clean bullet points for multi-part details.
 
 Recent Conversation:
@@ -161,10 +168,8 @@ ${contextBlock}
 Student Question: ${question}`;
 
   let answerText = "";
-  if (!genAI) {
-    answerText = `According to **${retrieved[0].documentTitle}** (${retrieved[0].department}):\n\n${retrieved[0].content}`;
-  } else {
-    for (const chatModel of ["gemini-3.8-flash", "gemini-3-flash", "gemini-2.5-flash"]) {
+  if (genAI) {
+    for (const chatModel of ["gemini-3.8-flash", "gemini-3.5-flash-lite", "gemini-3.5-flash"]) {
       try {
         const model = genAI.getGenerativeModel({ model: chatModel });
         const result = await model.generateContent(prompt);
@@ -174,9 +179,10 @@ Student Question: ${question}`;
         console.error(`Gemini generation error (${chatModel}):`, err.message);
       }
     }
-    if (!answerText) {
-      answerText = `Based on **${retrieved[0].documentTitle}**:\n\n${retrieved[0].content}`;
-    }
+  }
+
+  if (!answerText) {
+    answerText = `According to **${retrieved[0].documentTitle}** (${retrieved[0].department}):\n\n${retrieved[0].content}`;
   }
 
   return {
