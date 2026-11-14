@@ -14,6 +14,17 @@ const queryEmbeddingCache = new Map();
 const MAX_EMBED_CACHE = 100;
 
 /**
+ * Ensure every Campus GPT answer begins with "Thanks for asking!"
+ */
+function withGreetingPrefix(text) {
+  const cleaned = (text || "").trim();
+  if (/^thanks for asking/i.test(cleaned)) {
+    return cleaned;
+  }
+  return `Thanks for asking!\n\n${cleaned}`;
+}
+
+/**
  * Split extracted document text into clean, sentence-aligned chunks.
  */
 function chunkText(text, chunkSize = 850, overlap = 120) {
@@ -166,8 +177,9 @@ async function answerCollegeQuery(question, departmentFilter = "All", history = 
 
   if (retrieved.length === 0 || topScore < threshold) {
     return {
-      answer:
-        "I could not find verified information about that in the uploaded college documents. Please contact the relevant campus office or ask an administrator to upload the official notice or handbook.",
+      answer: withGreetingPrefix(
+        "I could not find verified information about that in the uploaded college documents. Please contact the relevant campus office or ask an administrator to upload the official notice or handbook."
+      ),
       sources: [],
       confidenceScore: Math.round(Math.max(0, topScore) * 100),
       isUnknown: true,
@@ -189,10 +201,11 @@ async function answerCollegeQuery(question, departmentFilter = "All", history = 
   const prompt = `You are Campus GPT, the official AI assistant for Birla Global University (BGU), Bhubaneswar.
 Answer concisely using ONLY the verified College Context below.
 Rules:
-1. Never invent dates, fees, or policies not explicitly stated in the context.
-2. Naturally cite the source document title(s).
-3. If the exact detail asked is missing, state that it is not specified in the uploaded documents.
-4. Use crisp bullet points for multi-part details.
+1. Always start your response with "Thanks for asking!" on the first line.
+2. Never invent dates, fees, or policies not explicitly stated in the context.
+3. Naturally cite the source document title(s).
+4. If the exact detail asked is missing, state that it is not specified in the uploaded documents.
+5. Use crisp bullet points for multi-part details.
 
 Recent Conversation:
 ${recentHistory || "None"}
@@ -227,7 +240,7 @@ Student Question: ${question}`;
   }
 
   return {
-    answer: answerText,
+    answer: withGreetingPrefix(answerText),
     sources: retrieved.map((r) => ({
       documentTitle: r.documentTitle,
       department: r.department,
