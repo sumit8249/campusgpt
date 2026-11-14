@@ -7,6 +7,12 @@ const genAI =
     ? new GoogleGenerativeAI(apiKey)
     : null;
 
+// In-memory caches to eliminate redundant MongoDB & Embedding API roundtrips
+let cachedChunks = null;
+let cachedChunkCount = -1;
+const queryEmbeddingCache = new Map();
+const MAX_EMBED_CACHE = 100;
+
 /**
  * Split extracted document text into clean, sentence-aligned chunks.
  */
@@ -57,19 +63,30 @@ function localFallbackEmbedding(text, dims = 128) {
 }
 
 /**
- * Generate dense vector embedding via Gemini gemini-embedding-001 (with local fallback).
+ * Generate dense vector embedding via Gemini gemini-embedding-001 (with RAM cache).
  */
 async function generateEmbedding(text) {
   if (!genAI) {
     return localFallbackEmbedding(text);
   }
 
+  const cacheKey = text.trim().toLowerCase();
+  if (queryEmbeddingCache.has(cacheKey)) {
+    return queryEmbeddingCache.get(cacheKey);
+  }
+
   for (const modelName of ["gemini-embedding-001", "embedding-001"]) {
     try {
       const model = genAI.getGenerativeModel({ model: modelName });
       const result = await model.embedContent(text);
-      if (result?.embedding?.values?.length) {
-        return result.embedding.values;
+      const values = result?.embedding?.values;
+      if (values?.length) {
+        if (queryEmbeddingCache.size >= MAX_EMBED_CACHE) {
+          const oldestKey = queryEmbeddingCache.keys().next().value;
+          queryEmbeddingCache.delete(oldestKey);
+        }
+        queryEmbeddingCache.set(cacheKey, values);
+        return values;
       }
     } catch (err) {
       console.warn(`Embedding fallback (${modelName}):`, err.message);
@@ -77,6 +94,22 @@ async function generateEmbedding(text) {
   }
 
   return localFallbackEmbedding(text);
+}
+
+/**
+ * Load all document chunks into RAM and auto-refresh only when document count changes.
+ */
+async function getCachedChunks() {
+  const currentCount = await DocumentChunk.estimatedDocumentCount();
+  if (cachedChunks && currentCount === cachedChunkCount) {
+    return cachedChunks;
+  }
+
+  cachedChunks = await DocumentChunk.find({})
+    .select("documentTitle department content embedding")
+    .lean();
+  cachedChunkCount = cachedChunks.length;
+  return cachedChunks;
 }
 
 /**
@@ -96,13 +129,15 @@ function cosineSimilarity(vecA, vecB) {
 }
 
 /**
- * Retrieve top-K most relevant chunks filtered optionally by department.
+ * Retrieve top-K most relevant chunks from RAM cache filtered optionally by department.
  */
 async function retrieveRelevantChunks(query, departmentFilter = "All", topK = 4) {
-  const filter =
-    departmentFilter && departmentFilter !== "All" ? { department: departmentFilter } : {};
+  const allChunks = await getCachedChunks();
+  const candidates =
+    departmentFilter && departmentFilter !== "All"
+      ? allChunks.filter((c) => c.department === departmentFilter)
+      : allChunks;
 
-  const candidates = await DocumentChunk.find(filter).lean();
   if (candidates.length === 0) return [];
 
   const isLocalVectors = candidates[0].embedding?.length === 128;
@@ -121,7 +156,7 @@ async function retrieveRelevantChunks(query, departmentFilter = "All", topK = 4)
 }
 
 /**
- * Execute full RAG pipeline: Retrieve -> Relevance Guardrail -> Grounded LLM Generation.
+ * Execute full RAG pipeline: Retrieve -> Relevance Guardrail -> Fast Grounded Generation.
  */
 async function answerCollegeQuery(question, departmentFilter = "All", history = []) {
   const retrieved = await retrieveRelevantChunks(question, departmentFilter, 4);
@@ -147,17 +182,17 @@ async function answerCollegeQuery(question, departmentFilter = "All", history = 
     .join("\n\n---\n\n");
 
   const recentHistory = history
-    .slice(-4)
+    .slice(-2)
     .map((m) => `${m.role === "user" ? "Student" : "Campus GPT"}: ${m.content}`)
     .join("\n");
 
-  const prompt = `You are Campus GPT, the official AI information assistant for Birla Global University (BGU), Bhubaneswar.
-Answer the student's question using ONLY the verified College Context provided below.
-Strict Rules:
-1. Never invent dates, fees, eligibility rules, or policies not explicitly stated in the context.
-2. Naturally cite the source document title(s) in your response.
-3. If the context does not contain the exact detail asked (such as tuition or semester fees), explicitly state that it is not specified in the uploaded documents and only share related verified details if helpful.
-4. Use clean bullet points for multi-part details.
+  const prompt = `You are Campus GPT, the official AI assistant for Birla Global University (BGU), Bhubaneswar.
+Answer concisely using ONLY the verified College Context below.
+Rules:
+1. Never invent dates, fees, or policies not explicitly stated in the context.
+2. Naturally cite the source document title(s).
+3. If the exact detail asked is missing, state that it is not specified in the uploaded documents.
+4. Use crisp bullet points for multi-part details.
 
 Recent Conversation:
 ${recentHistory || "None"}
@@ -169,9 +204,15 @@ Student Question: ${question}`;
 
   let answerText = "";
   if (genAI) {
-    for (const chatModel of ["gemini-3.8-flash", "gemini-3.5-flash-lite", "gemini-3.5-flash"]) {
+    for (const chatModel of ["gemini-3.5-flash-lite", "gemini-3.8-flash", "gemini-3.6-flash"]) {
       try {
-        const model = genAI.getGenerativeModel({ model: chatModel });
+        const model = genAI.getGenerativeModel({
+          model: chatModel,
+          generationConfig: {
+            temperature: 0.2,
+            maxOutputTokens: 450,
+          },
+        });
         const result = await model.generateContent(prompt);
         answerText = result.response.text();
         if (answerText) break;
